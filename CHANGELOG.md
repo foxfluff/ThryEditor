@@ -1,3 +1,8 @@
+# [2.74.0]
+## Changes
+- Changed some icons, which will play an important part in upcoming "massive" changes in the future.
+- Some other safety fixes.
+
 # [2.73.9]
 ## Changes
 - HOTFIX: Fixed a bug where two or more materials sharing different values overwrite each other (such as `_BumpScale`).
