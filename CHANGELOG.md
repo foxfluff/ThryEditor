@@ -1,3 +1,8 @@
+# [2.74.1]
+## Changes
+- Fixed Cubemap filter picking.
+- Fixed Cubemap validation in texture fields.
+
 # [2.74.0]
 ## Changes
 - Changed some icons, which will play an important part in upcoming "massive" changes in the future.
