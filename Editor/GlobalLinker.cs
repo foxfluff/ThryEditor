@@ -62,8 +62,12 @@ namespace Thry.ThryEditor
     [Serializable]
     public class GlobalLink
     {
+        // Keep policy undo tied to this link even if its name is later reused.
+        public string id = Guid.NewGuid().ToString("N");
         public string name;
         public string sectionPropertyName; // e.g. "m_start_Shading"
+        // Missing fields in older JSON retain the constructor default.
+        public bool includeTextures = true;
         public GlobalLinkPropertyValue[] properties = new GlobalLinkPropertyValue[0];
         public string[] subscribedMaterialGuids = new string[0];
     }
@@ -74,19 +78,61 @@ namespace Thry.ThryEditor
         public GlobalLink[] links = new GlobalLink[0];
     }
 
+    internal class GlobalLinkUndoState : ScriptableObject
+    {
+        public string json;
+    }
+
     [InitializeOnLoad]
     public class GlobalLinker
     {
         private static List<GlobalLink> s_data;
+        private static GlobalLinkUndoState s_undoState;
+        private static string s_appliedUndoJson;
+
+        private static void SyncUndoState(string json)
+        {
+            if (s_undoState == null)
+            {
+                s_undoState = Resources.FindObjectsOfTypeAll<GlobalLinkUndoState>().FirstOrDefault();
+                if (s_undoState == null)
+                {
+                    s_undoState = ScriptableObject.CreateInstance<GlobalLinkUndoState>();
+                    s_undoState.hideFlags = HideFlags.HideAndDontSave;
+                }
+            }
+            s_undoState.json = json;
+            s_appliedUndoJson = json;
+        }
 
         static GlobalLinker()
         {
+            // Establish the baseline after a domain reload before Unity restores an undo snapshot.
+            Load();
             Undo.undoRedoPerformed += OnUndoRedoPerformed;
         }
 
         private static void OnUndoRedoPerformed()
         {
             Load();
+            if (s_undoState != null && s_undoState.json != s_appliedUndoJson)
+            {
+                var restored = Parser.Deserialize<GlobalLinksData>(s_undoState.json);
+                var previous = Parser.Deserialize<GlobalLinksData>(s_appliedUndoJson);
+                // Other database edits are not policy undo operations. Preserve current links,
+                // subscriptions and shading values instead of restoring an obsolete database.
+                foreach (var policy in restored.links)
+                {
+                    var before = previous.links.FirstOrDefault(l => l.id == policy.id);
+                    var current = s_data.FirstOrDefault(l => l.id == policy.id);
+                    if (before == null || current == null || before.includeTextures == policy.includeTextures) continue;
+                    current.includeTextures = policy.includeTextures;
+                    current.properties = current.properties.Where(p => p.type != "Texture")
+                        .Concat(policy.properties.Where(p => policy.includeTextures && p.type == "Texture")).ToArray();
+                }
+                Save();
+                RequestRepaint();
+            }
             bool dirty = false;
             foreach (GlobalLink link in s_data)
             {
@@ -104,6 +150,10 @@ namespace Thry.ThryEditor
                 if (RecaptureFromMaterial(link, truth)) dirty = true;
             }
             if (dirty) Save();
+            if (s_window != null)
+            {
+                s_window.Repaint();
+            }
         }
 
         private static void Load()
@@ -116,13 +166,16 @@ namespace Thry.ThryEditor
                 if (parsed?.links != null) s_data = new List<GlobalLink>(parsed.links);
             }
             if (s_data == null) s_data = new List<GlobalLink>();
+            SyncUndoState(Parser.Serialize(new GlobalLinksData { links = s_data.ToArray() }, prettyPrint: true));
         }
 
         private static void Save()
         {
             GlobalLinksData data = new GlobalLinksData();
             data.links = s_data.ToArray();
-            FileHelper.WriteStringToFile(Parser.Serialize(data, prettyPrint: true), PATH.GLOBAL_LINKS_FILE);
+            string json = Parser.Serialize(data, prettyPrint: true);
+            FileHelper.WriteStringToFile(json, PATH.GLOBAL_LINKS_FILE);
+            SyncUndoState(json);
         }
 
         public static void InvalidateCache()
@@ -160,12 +213,13 @@ namespace Thry.ThryEditor
             return CreateLink(name, sectionPropertyName, section, selected);
         }
 
-        public static GlobalLink CreateLink(string name, string sectionPropertyName, ShaderGroup section, IEnumerable<Material> materials)
+        public static GlobalLink CreateLink(string name, string sectionPropertyName, ShaderGroup section, IEnumerable<Material> materials, bool includeTextures = false)
         {
             Load();
 
             GlobalLink link = new GlobalLink();
             link.name = name;
+            link.includeTextures = includeTextures;
             link.sectionPropertyName = sectionPropertyName;
             CapturePropertiesFromSection(link, section);
 
@@ -181,6 +235,29 @@ namespace Thry.ThryEditor
             s_data.Add(link);
             Save();
             return link;
+        }
+
+        /// <summary>Changes the policy for every subscriber. Enabling captures the inspected section.</summary>
+        public static void SetIncludeTextures(GlobalLink link, bool includeTextures, ShaderGroup section)
+        {
+            Load();
+            if (link == null) return;
+            // Resolve again if the database cache has been reloaded.
+            link = s_data.FirstOrDefault(l => l.id == link.id);
+            if (link == null || link.includeTextures == includeTextures) return;
+            Undo.IncrementCurrentGroup();
+            int undoGroup = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Change Global Link Include Textures");
+            Undo.RegisterCompleteObjectUndo(s_undoState, "Change Global Link Include Textures");
+            link.includeTextures = includeTextures;
+            if (includeTextures) OverwriteLinkFromSection(link, section);
+            else
+            {
+                link.properties = link.properties.Where(p => p.type != "Texture").ToArray();
+                Save();
+                RequestRepaint();
+            }
+            Undo.CollapseUndoOperations(undoGroup);
         }
 
         public static void Subscribe(GlobalLink link, Material material, bool applyLinkToMaterial)
@@ -349,6 +426,7 @@ namespace Thry.ThryEditor
             bool changed = false;
             foreach (GlobalLinkPropertyValue pv in link.properties)
             {
+                if (!link.includeTextures && pv.type == "Texture") continue;
                 if (!material.HasProperty(pv.name)) continue;
                 switch (pv.type)
                 {
@@ -410,6 +488,7 @@ namespace Thry.ThryEditor
         {
             List<GlobalLinkPropertyValue> captured = new List<GlobalLinkPropertyValue>();
             CaptureRecursive(captured, section);
+            if (!link.includeTextures) captured.RemoveAll(p => p.type == "Texture");
             bool changed = !IsSamePropertySet(link.properties, captured);
             link.properties = captured.ToArray();
             return changed;
@@ -545,6 +624,7 @@ namespace Thry.ThryEditor
             if (recordUndo) Undo.RecordObject(material, "Update Global Link \"" + link.name + "\"");
             foreach (GlobalLinkPropertyValue pv in link.properties)
             {
+                if (!link.includeTextures && pv.type == "Texture") continue;
                 if (!material.HasProperty(pv.name)) continue;
 
                 switch (pv.type)
@@ -623,6 +703,8 @@ namespace Thry.ThryEditor
             private Material[] _materials;
             private string _sectionPropertyName;
             private string _newLinkName = "";
+            private bool _newIncludeTextures = false;
+            private const string TexturePolicyTooltip = "Applies to every material in this link. Disable to preserve each material’s textures, tiling, offset and texture animation tags. Enabling copies textures from the inspected material.";
             private Vector2 _scrollPos;
             private List<GlobalLink> _availableLinks;
             private GlobalLink _currentLink;       // non-null only when ALL selected materials share the same link
@@ -673,6 +755,7 @@ namespace Thry.ThryEditor
                     return;
                 }
 
+                RefreshState();
                 // Header
                 GUILayout.Label("Global Links", EditorStyles.boldLabel);
                 GUILayout.Space(4);
@@ -696,6 +779,11 @@ namespace Thry.ThryEditor
                     {
                         Unsubscribe(_materials, _sectionPropertyName);
                         RefreshState();
+                    }
+                    if (_currentLink != null)
+                    {
+                        bool include = EditorGUILayout.Toggle(new GUIContent("Include Textures", TexturePolicyTooltip), _currentLink.includeTextures);
+                        if (include != _currentLink.includeTextures) SetIncludeTextures(_currentLink, include, _section);
                     }
                     GUILayout.Space(4);
                 }
@@ -742,6 +830,7 @@ namespace Thry.ThryEditor
 
                 // Create New Link
                 GUILayout.Label("Create New Link:", EditorStyles.miniBoldLabel);
+                _newIncludeTextures = EditorGUILayout.Toggle(new GUIContent("Include Textures", TexturePolicyTooltip), _newIncludeTextures);
                 GUILayout.BeginHorizontal();
                 _newLinkName = EditorGUILayout.TextField(_newLinkName);
                 EditorGUI.BeginDisabledGroup(string.IsNullOrWhiteSpace(_newLinkName));
@@ -757,7 +846,7 @@ namespace Thry.ThryEditor
                         // Drop any existing links on the selected materials first (force-switch)
                         Unsubscribe(_materials, _sectionPropertyName);
 
-                        GlobalLink newLink = CreateLink(_newLinkName, _sectionPropertyName, _section, _materials);
+                        GlobalLink newLink = CreateLink(_newLinkName, _sectionPropertyName, _section, _materials, _newIncludeTextures);
                         _newLinkName = "";
                         RefreshState();
                     }
